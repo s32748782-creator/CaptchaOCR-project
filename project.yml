@@ -1,0 +1,28 @@
+name: CaptchaOCR
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "17.0"
+
+targets:
+  CaptchaOCR:
+    type: application
+    platform: iOS
+    sources:
+      - CaptchaOCR
+    scheme: {}
+    info:
+      path: CaptchaOCR/Info.plist
+      properties:
+        CFBundleDisplayName: 驗證碼辨識
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        NSCameraUsageDescription: 需要使用相機拍攝驗證碼
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.captchaocr
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
