@@ -1,12 +1,18 @@
 import SwiftUI
 import PhotosUI
 
+enum Engine: String, CaseIterable, Identifiable {
+    case custom = "自訂模型"
+    case vision = "Apple Vision"
+    var id: String { rawValue }
+}
+
 /// 任何設定改變都會自動重新辨識
 private struct RunKey: Equatable {
     var version: Int
-    var mode: CharsetMode
-    var length: Int?
-    var uppercase: Bool
+    var engine: Engine
+    var settings: OCRSettings
+    var useVariants: Bool
     var options: PreprocessOptions
 }
 
@@ -16,10 +22,17 @@ struct ContentView: View {
     @State private var processed: UIImage?
     @State private var imageVersion = 0
 
-    @State private var mode: CharsetMode = .alphanumeric
-    @State private var useLength = true
-    @State private var length = 4
-    @State private var uppercase = true
+    // 自訂 ONNX 模型只載入一次
+    private static let model = Result(catching: { try OnnxOCR() })
+
+    // 用 AppStorage 保存設定，下次開 App 不用重設
+    @AppStorage("engine") private var engine: Engine = .custom
+    @AppStorage("mode") private var mode: CharsetMode = .letters
+    @AppStorage("caseMode") private var caseMode: CaseMode = .lower
+    @AppStorage("useLength") private var useLength = true
+    @AppStorage("length") private var length = 4
+    @AppStorage("useFast") private var useFast = true
+    @AppStorage("useVariants") private var useVariants = true
     @State private var options = PreprocessOptions()
 
     @State private var candidates: [OCRCandidate] = []
@@ -28,10 +41,16 @@ struct ContentView: View {
     @State private var showCamera = false
     @State private var copied: String?
 
+    private var settings: OCRSettings {
+        OCRSettings(mode: mode,
+                    expectedLength: useLength ? length : nil,
+                    caseMode: caseMode,
+                    useFastLevel: useFast)
+    }
+
     private var runKey: RunKey {
-        RunKey(version: imageVersion, mode: mode,
-               length: useLength ? length : nil,
-               uppercase: uppercase, options: options)
+        RunKey(version: imageVersion, engine: engine, settings: settings,
+               useVariants: useVariants, options: options)
     }
 
     var body: some View {
@@ -39,8 +58,11 @@ struct ContentView: View {
             Form {
                 sourceSection
                 resultSection
-                settingsSection
-                preprocessSection
+                engineSection
+                if engine == .vision {
+                    settingsSection
+                    preprocessSection
+                }
             }
             .navigationTitle("驗證碼辨識")
             .onChange(of: pickerItem) { _, item in
@@ -80,7 +102,7 @@ struct ContentView: View {
             .buttonStyle(.borderless)
 
             if let original { ImageRow(title: "原圖", image: original) }
-            if let processed, options.enabled { ImageRow(title: "前處理後（實際送去辨識的圖）", image: processed) }
+            if let processed, options.enabled, engine == .vision { ImageRow(title: "前處理後（實際送去辨識的圖）", image: processed) }
         }
     }
 
@@ -99,9 +121,18 @@ struct ContentView: View {
                         Text(candidate.text)
                             .font(.system(index == 0 ? .title : .body, design: .monospaced))
                             .bold(index == 0)
+                        if candidate.isVote {
+                            Text("投票")
+                                .font(.caption2).bold()
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(.green.opacity(0.2), in: Capsule())
+                                .foregroundStyle(.green)
+                        }
                         Spacer()
-                        Text(String(format: "%.0f%%", candidate.confidence * 100))
-                            .foregroundStyle(.secondary)
+                        if engine == .vision {
+                            Text("\(candidate.votes) 票")
+                                .foregroundStyle(.secondary)
+                        }
                         Image(systemName: copied == candidate.text ? "checkmark" : "doc.on.doc")
                     }
                 }
@@ -111,18 +142,41 @@ struct ContentView: View {
         }
     }
 
+    private var engineSection: some View {
+        Section {
+            Picker("辨識引擎", selection: $engine) {
+                ForEach(Engine.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+        } footer: {
+            if engine == .custom, case .failure(let error) = Self.model {
+                Text("模型載入失敗：\(error.localizedDescription)").foregroundStyle(.red)
+            } else if engine == .custom {
+                Text("使用 App 內建的 custom.onnx 模型，直接辨識原圖，不需要前處理。")
+            }
+        }
+    }
+
     private var settingsSection: some View {
-        Section("辨識設定") {
+        Section {
             Picker("字元類型", selection: $mode) {
                 ForEach(CharsetMode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            if mode != .digits {
+                Picker("大小寫", selection: $caseMode) {
+                    ForEach(CaseMode.allCases) { Text($0.rawValue).tag($0) }
+                }
             }
             Toggle("固定長度", isOn: $useLength)
             if useLength {
                 Stepper("長度：\(length)", value: $length, in: 1...12)
             }
-            if mode != .digits {
-                Toggle("轉成大寫", isOn: $uppercase)
-            }
+            Toggle("同時用快速模式辨識", isOn: $useFast)
+            Toggle("多種前處理交叉投票", isOn: $useVariants)
+        } header: {
+            Text("辨識設定")
+        } footer: {
+            Text("投票需要開啟「固定長度」。交叉投票會多跑幾次辨識，準確率較高但稍慢。")
         }
     }
 
@@ -130,6 +184,10 @@ struct ContentView: View {
         Section("影像前處理") {
             Toggle("啟用前處理", isOn: $options.enabled)
             if options.enabled {
+                VStack(alignment: .leading) {
+                    Text("放大到高度：\(Int(options.targetHeight)) px")
+                    Slider(value: $options.targetHeight, in: 60...400, step: 20)
+                }
                 VStack(alignment: .leading) {
                     Text("對比：\(options.contrast, specifier: "%.1f")")
                     Slider(value: $options.contrast, in: 0.5...3)
@@ -170,31 +228,71 @@ struct ContentView: View {
         guard let original else { return }
 
         // 簡單防抖：拖動滑桿時不要每一格都辨識
-        try? await Task.sleep(for: .milliseconds(200))
+        try? await Task.sleep(for: .milliseconds(250))
         if Task.isCancelled { return }
 
         isRunning = true
         defer { isRunning = false }
 
+        if engine == .custom {
+            await runCustomModel(on: original)
+            return
+        }
+
         let opts = options
-        let image = await Task.detached(priority: .userInitiated) {
-            ImagePreprocessor.process(original, options: opts)
+        let variants = useVariants
+        let images: [UIImage] = await Task.detached(priority: .userInitiated) {
+            var list = [ImagePreprocessor.process(original, options: opts)]
+            if variants {
+                // 二值化開關相反的版本
+                var flipped = opts
+                flipped.enabled = true
+                flipped.binarize.toggle()
+                list.append(ImagePreprocessor.process(original, options: flipped))
+                // 不同放大倍率的版本
+                var bigger = opts
+                bigger.enabled = true
+                bigger.targetHeight = opts.targetHeight * 1.5
+                list.append(ImagePreprocessor.process(original, options: bigger))
+                // 完全不處理的原圖
+                var plain = opts
+                plain.enabled = false
+                list.append(ImagePreprocessor.process(original, options: plain))
+            }
+            return list
         }.value
         if Task.isCancelled { return }
-        processed = image
+        processed = images.first
 
         do {
-            let result = try await OCRService.recognize(
-                image,
-                mode: mode,
-                expectedLength: useLength ? length : nil,
-                uppercase: uppercase
-            )
+            let result = try await OCRService.recognize(images: images, settings: settings)
             if Task.isCancelled { return }
             candidates = result
             errorMessage = result.isEmpty ? "沒有辨識到文字，試著調整前處理參數" : nil
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+}
+
+extension ContentView {
+    private func runCustomModel(on image: UIImage) async {
+        processed = nil
+        switch Self.model {
+        case .failure(let error):
+            candidates = []
+            errorMessage = "模型載入失敗：\(error.localizedDescription)"
+        case .success(let model):
+            do {
+                let text = try await Task.detached(priority: .userInitiated) {
+                    try model.recognize(image)
+                }.value
+                if Task.isCancelled { return }
+                candidates = text.isEmpty ? [] : [OCRCandidate(text: text, score: 1)]
+                errorMessage = text.isEmpty ? "模型沒有辨識出文字" : nil
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 }

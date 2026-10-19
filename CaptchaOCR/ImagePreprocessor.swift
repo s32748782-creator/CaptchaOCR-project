@@ -32,14 +32,18 @@ enum ImagePreprocessor {
         var ci = CIImage(cgImage: cg)
 
         // 1. 放大（Lanczos 插值，保留邊緣）
-        let height = ci.extent.height
-        if height < options.targetHeight {
+        if ci.extent.height < options.targetHeight {
             let scale = CIFilter.lanczosScaleTransform()
             scale.inputImage = ci
-            scale.scale = Float(options.targetHeight / height)
+            scale.scale = Float(options.targetHeight / ci.extent.height)
             scale.aspectRatio = 1
             ci = scale.outputImage ?? ci
         }
+
+        // 切掉縮放後邊緣的半透明像素，並把邊緣往外延伸，
+        // 避免後面的濾鏡在圖片四周產生黑框
+        let extent = ci.extent.integral.insetBy(dx: 2, dy: 2)
+        ci = ci.cropped(to: extent).clampedToExtent()
 
         // 2. 灰階 + 提高對比
         let color = CIFilter.colorControls()
@@ -70,10 +74,9 @@ enum ImagePreprocessor {
             ci = threshold.outputImage ?? ci
         }
 
-        // 6. 加白邊，文字貼邊時 Vision 比較容易漏字
-        let extent = ci.extent.integral
-        let background = CIImage(color: .white).cropped(to: extent.insetBy(dx: -24, dy: -24))
-        ci = ci.cropped(to: extent).composited(over: background)
+        // 6. 用背景色向外延伸留白，文字貼邊時 Vision 比較不會漏字
+        ci = ci.cropped(to: extent).clampedToExtent()
+            .cropped(to: extent.insetBy(dx: -24, dy: -24))
 
         guard let output = context.createCGImage(ci, from: ci.extent) else { return upright }
         return UIImage(cgImage: output)
